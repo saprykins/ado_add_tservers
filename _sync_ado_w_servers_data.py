@@ -3,31 +3,57 @@ import requests
 import json
 import csv
 import sys
-
+import time
+from datetime import datetime
 
 if len(sys.argv) > 1:
     fn_ado_enriched = sys.argv[1]
     fn_log = sys.argv[2]
 
+with open('config.json') as config_file:
+    config = json.load(config_file)
 
-
-organization = "g-"
-project = "C-"
-pat = "C"
-server_workitem = "T-"
+organization = config["org_name"]
+project = config["proj_name"]
+pat = config["access_token"]
+server_workitem = config["item_type"]
 
 
 # Read the CSV file into a Pandas DataFrame
 csv_file_path = fn_ado_enriched
 
-
 def write_to_csv(*args):
-    with open(fn_log, 'a', newline='') as file:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # Get the current timestamp
+    with open(fn_log, 'a', newline='') as file:  # Keep the append mode to add new entries
         writer = csv.writer(file)
-        writer.writerow(args)
+        writer.writerow([timestamp] + list(args))  # Prepend the timestamp to the log entry
 
 
-def create_child(workitemtype, title, parent_id, inf_src):
+def get_app_url(parent_id):
+    url = f"https://dev.azure.com/{organization}/_apis/wit/workItems/{parent_id}?$expand=all"
+    headers = {
+        "Content-Type": "application/json-patch+json"
+    }
+    
+    for attempt in range(3):  # Retry up to 3 times
+        try:
+            response = requests.get(
+                url=url,
+                headers=headers,
+                auth=("", pat),
+                timeout=30  # Increase timeout
+            )
+            response.raise_for_status()
+            return response.json()["url"]
+        except requests.exceptions.RequestException as e:
+            print(f"Attempt {attempt + 1}: Failed to get app URL: {e}")
+            time.sleep(5)  # Wait for 5 seconds before retrying
+
+    raise Exception("Failed to get app URL after multiple attempts.")
+
+
+
+def create_child(workitemtype, title, parent_id, inf_src, target, server_title):
     url = f"https://dev.azure.com/{organization}/{project}/_apis/wit/workitems/${workitemtype}?api-version=7.0"
 
     headers = {
@@ -38,12 +64,12 @@ def create_child(workitemtype, title, parent_id, inf_src):
         {
             "op": "add",
             "path": "/fields/System.Title",
-            "value": title  # Set the server title
+            "value": title
         },
         {
             "op": "add",
             "path": "/fields/System.Parent",
-            "value": parent_id  # Set the parent work item ID (application ID)
+            "value": parent_id
         },
         {
             "op": "add",
@@ -56,7 +82,12 @@ def create_child(workitemtype, title, parent_id, inf_src):
         {
             "op": "add",
             "path": "/fields/Information_source",
-            "value": inf_src  # Set the Information_source field to "delete"
+            "value": inf_src
+        },
+        {
+            "op": "add",
+            "path": "/fields/Custom.Target",
+            "value": target  # Set the Target field based on csp value
         }
     ]
 
@@ -66,37 +97,21 @@ def create_child(workitemtype, title, parent_id, inf_src):
             data=json.dumps(body),
             headers=headers,
             auth=("", pat),
-            timeout=10  # Set a timeout
+            timeout=30
         )
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
         print(f"Failed to create server work item: {e}")
-        write_to_csv("Server_ID", "", "server_name", "creation_failed")
+        write_to_csv("Server_ID", "", server_title, "creation_failed")
         return None
 
     work_item_id = response.json()['id']
     print(f"Server Work Item ID: {work_item_id} created successfully")
-    write_to_csv("Server_ID", work_item_id, "server_name", "created_successfully")
-    return work_item_id  # Return the server work_item_id if successful
+    write_to_csv("Server_ID", work_item_id, server_title, "created_successfully")
+    return work_item_id
 
 
-def get_app_url(parent_id):
-    url = f"https://dev.azure.com/{organization}/_apis/wit/workItems/{parent_id}?$expand=all"
-
-    headers = {
-        "Content-Type": "application/json-patch+json"
-    }
-
-    response = requests.get(
-        url=url,
-        headers=headers,
-        auth=("", pat),
-        timeout=10  # Set a timeout
-    )
-    return response.json()["url"]
-
-
-def modify_existing(workitemtype, title, work_item_id, inf_src):
+def modify_existing(workitemtype, title, work_item_id, inf_src, target, server_title):
     url = f"https://dev.azure.com/{organization}/{project}/_apis/wit/workitems/{work_item_id}?api-version=7.0"
 
     headers = {
@@ -107,12 +122,17 @@ def modify_existing(workitemtype, title, work_item_id, inf_src):
         {
             "op": "replace",
             "path": "/fields/System.Title",
-            "value": title  # Set the updated title
+            "value": title
         },
         {
             "op": "replace",
             "path": "/fields/Information_source",
-            "value": inf_src  # Set the updated Information_source field
+            "value": inf_src
+        },
+        {
+            "op": "replace",
+            "path": "/fields/Custom.Target",
+            "value": target  # Update the Target field
         }
     ]
 
@@ -122,34 +142,50 @@ def modify_existing(workitemtype, title, work_item_id, inf_src):
             data=json.dumps(body),
             headers=headers,
             auth=("", pat),
-            timeout=10  # Set a timeout
+            timeout=30
         )
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
         print(f"Failed to update server work item: {e}")
-        write_to_csv("Server_ID", work_item_id, "server_name", "update_failed")
+        write_to_csv("Server_ID", work_item_id, server_title, "update_failed")
         return None
 
     print(f"Server Work Item ID: {work_item_id} updated successfully")
-    write_to_csv("Server_ID", work_item_id, "server_name", "updated_successfully")
-    return work_item_id  # Return the server work_item_id if successful
+    write_to_csv("Server_ID", work_item_id, server_title, "updated_successfully")
+    return work_item_id
+
+
+
+def map_csp_to_target(csp_value):
+    """ Map the csp value to the corresponding target string. """
+    if pd.isna(csp_value) or csp_value.strip() == "":
+        return ""
+    mapping = {
+        "pod": "P--",
+        "aws": "M---AWS",
+        "azure": "M---Azure"
+    }
+    return mapping.get(csp_value.lower(), "")
 
 
 df = pd.read_csv(csv_file_path)
 
 # Iterate through the CSV data to create servers for each application
-for index, row in df.iterrows():
-    app_title = row['app_sys_id']  # Assuming 'app_sys_id' is the column with application titles
-    server_title = row['servers']  # Assuming 'servers' is the column with server titles
-    parent_id = row['env_id_ado']
-    inf_src = row['inf_src']  # Assuming 'inf_src' is the column with Information_source values
-    server_id_ado = row['server_id_ado']  # Assuming 'server_id_ado' is the column with server work_item_id
 
-    if pd.notna(server_id_ado):  # Check if server_id_ado is not empty
-        # Modify the existing work item (server) with the specified server_id_ado
+for index, row in df.iterrows():
+    app_title = row['app_sys_id']
+    server_title = row['servers']
+    parent_id = row['env_id_ado']
+    inf_src = row['inf_src']
+    server_id_ado = row['server_id_ado']
+    csp = row['csp']  # Assuming 'csp' is the column with CSP values
+
+    # Map csp value to target
+    target = map_csp_to_target(csp)
+
+    if pd.notna(server_id_ado):
         server_id_ado = int(server_id_ado)
-        modify_existing(server_workitem, server_title, server_id_ado, inf_src)
+        modify_existing(server_workitem, server_title, server_id_ado, inf_src, target, server_title)
     else:
         parent_id = int(parent_id)
-        # Create the child work item (server) for the application
-        create_child(server_workitem, server_title, parent_id, inf_src)
+        create_child(server_workitem, server_title, parent_id, inf_src, target, server_title)
